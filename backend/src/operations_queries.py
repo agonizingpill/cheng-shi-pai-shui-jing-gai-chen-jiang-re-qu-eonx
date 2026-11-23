@@ -3,6 +3,7 @@
 from .operations_reconciliation import RECONCILIATION_VIEWS
 
 from .road_reopening import VIEW as ROAD_REOPENING
+from .barricade_views import VIEWS as BARRICADE_VIEWS
 
 VIEWS = {
     'permit-coordination': (
@@ -30,4 +31,5 @@ FROM resurveys r JOIN repair_zones z ON z.id=r.zone_id ORDER BY r.measured_at DE
     ),
     **RECONCILIATION_VIEWS,
     'road-reopening': ROAD_REOPENING,
+    **BARRICADE_VIEWS,
 }

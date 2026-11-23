@@ -4,11 +4,10 @@ from math import pi
 import numpy as np
 from sklearn.cluster import DBSCAN
 from sqlalchemy import select
-from ..models import AnalysisJob, RepairZone, SurveyBatch, SurveyPoint, WorkNotice
+from ..constants.algorithm import EPS_METERS, MIN_SAMPLES
+from ..models import AnalysisJob, PointDisposition, RepairZone, SurveyBatch, SurveyPoint, WorkNotice
 from .geometry import bounds, overlaps
-
-EPS_METERS = 26.0
-MIN_SAMPLES = 3
+from .barricades import apply_current_rules, lock_batch
 
 def build_input(db, batch):
     points = db.execute(select(SurveyPoint).where(SurveyPoint.batch_id == batch.id).order_by(SurveyPoint.id)).scalars().all()
@@ -35,7 +34,15 @@ def cluster_batch(db, job_id):
             db.commit(); return
         matrix = np.array([[p["x"], p["y"]] for p in points], dtype=float)
         labels = DBSCAN(eps=EPS_METERS, min_samples=MIN_SAMPLES).fit_predict(matrix)
+        lock_batch(db, batch.id)
+        # Dispositions reference zones, so they must go before the zones.
+        db.execute(PointDisposition.__table__.delete().where(PointDisposition.batch_id == batch.id))
         existing = db.execute(select(RepairZone).where(RepairZone.batch_id == batch.id)).scalars().all()
+        # Break the self-referential split links first so Postgres' FK checks
+        # stay satisfied while the zones are deleted.
+        for zone in existing:
+            zone.split_from_id = None
+        db.flush()
         for zone in existing:
             db.delete(zone)
         db.flush()
@@ -81,6 +88,7 @@ def cluster_batch(db, job_id):
                 model_point.quality_status = "clustered"
         batch.status = "clustered"
         job.result = {"algorithm": "DBSCAN + local density score", "eps_m": EPS_METERS, "min_samples": MIN_SAMPLES, "cluster_count": cluster_count, "noise_count": noise_count, "conflicted_zones": conflicts, "point_count": len(points), "formula": "local_density = cluster_points / bbox_area × 10000"}
+        apply_current_rules(db, batch.id)
         job.status = "succeeded"; job.finished_at = datetime.now(timezone.utc)
         db.commit()
     except Exception as exc:

@@ -8,10 +8,20 @@ from redis import Redis
 
 from .operations_evidence import router as operations_evidence
 from .database import Base, SessionLocal, engine, get_db
-from .models import AnalysisJob, AuditLog, ManholeAsset, RepairZone, Resurvey, SurveyBatch, SurveyPoint, User, WorkNotice
-from .schemas import BatchIn, LoginIn, NoticeIn, ResurveyIn, SurveyPointIn
+from .models import AnalysisJob, AuditLog, Barricade, BarricadeRuleSet, ManholeAsset, RepairZone, Resurvey, SurveyBatch, SurveyPoint, User, WorkNotice
+from .schemas import BarricadeIn, BatchIn, LoginIn, NoticeIn, ResurveyIn, SurveyPointIn
 from .security import create_token, current_user, require_roles, verify_password
 from .services.audit import record
+from .services.barricades import (
+    barricade_code,
+    barricade_view,
+    disposition_rows,
+    lock_batch,
+    normalize_boundary,
+    recompute_after_rule_change,
+    revision_of,
+    sync_dispositions,
+)
 from .services.cluster import build_input
 from .services.geometry import bounds, overlaps
 from .middlewares.audit import RequestAuditMiddleware
@@ -55,7 +65,11 @@ def point_view(p):
 def zone_view(z, db):
     notice = db.get(WorkNotice, z.conflict_notice_id) if z.conflict_notice_id else None
     point_rows = db.execute(select(SurveyPoint).where(SurveyPoint.id.in_(z.point_ids or []))).scalars().all() if z.point_ids else []
-    return {"id": z.id, "zone_code": z.zone_code, "batch_id": z.batch_id, "cluster_label": z.cluster_label, "name": z.name, "status": z.status, "point_ids": z.point_ids or [], "point_codes": [p.point_code for p in point_rows], "center_x": z.center_x, "center_y": z.center_y, "average_settlement_mm": z.average_settlement_mm, "max_settlement_mm": z.max_settlement_mm, "local_density": z.local_density, "boundary": z.boundary, "original_cluster_evidence": z.original_cluster_evidence, "split_from_id": z.split_from_id, "conflict_notice_id": z.conflict_notice_id, "split_reason": z.split_reason, "conflict_road": notice.road_name if notice else None}
+    evidence = z.original_cluster_evidence or {}
+    partition = evidence.get("barricade_partition") or {}
+    derived = evidence.get("partition") == "barricade"
+    summary = partition.get("last_summary") or {}
+    return {"id": z.id, "zone_code": z.zone_code, "batch_id": z.batch_id, "cluster_label": z.cluster_label, "name": z.name, "status": z.status, "point_ids": z.point_ids or [], "point_codes": [p.point_code for p in point_rows], "center_x": z.center_x, "center_y": z.center_y, "average_settlement_mm": z.average_settlement_mm, "max_settlement_mm": z.max_settlement_mm, "local_density": z.local_density, "boundary": z.boundary, "original_cluster_evidence": z.original_cluster_evidence, "split_from_id": z.split_from_id, "conflict_notice_id": z.conflict_notice_id, "split_reason": z.split_reason, "conflict_road": notice.road_name if notice else None, "derived": derived, "partition_revision": evidence.get("revision") if derived else partition.get("revision"), "deferred_point_codes": summary.get("deferred", []), "unassigned_point_codes": summary.get("unassigned", []), "parent_zone": evidence.get("parent_zone") if derived else None}
 
 def notice_view(n):
     return {"id": n.id, "notice_code": n.notice_code, "zone_id": n.zone_id, "road_name": n.road_name, "contractor": n.contractor, "permit_no": n.permit_no, "starts_at": iso(n.starts_at), "ends_at": iso(n.ends_at), "boundary": n.boundary, "status": n.status, "lane_closure_required": n.lane_closure_required, "conflict_note": n.conflict_note}
@@ -83,7 +97,11 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(current_user))
     notices = db.execute(select(WorkNotice).order_by(WorkNotice.id)).scalars().all()
     resurveys = db.execute(select(Resurvey).order_by(Resurvey.id.desc())).scalars().all()
     jobs = db.execute(select(AnalysisJob).order_by(AnalysisJob.id.desc())).scalars().all()
-    return {"user": user_view(user), "stats": {"assets": len(assets), "points": len(points), "zones": len(zones), "open_zones": sum(z.status not in ["closed", "split"] for z in zones), "notices": len(notices), "resurveys": len(resurveys)}, "batches": [{"id": b.id, "batch_code": b.batch_code, "measured_at": iso(b.measured_at), "instrument": b.instrument, "coordinate_reference": b.coordinate_reference, "status": b.status, "notes": b.notes, "point_count": len(b.points)} for b in batches], "assets": [asset_view(a) for a in assets], "points": [point_view(p) for p in points], "zones": [zone_view(z, db) for z in zones], "notices": [notice_view(n) for n in notices], "resurveys": [resurvey_view(r) for r in resurveys], "jobs": [{"id": j.id, "job_code": j.job_code, "batch_id": j.batch_id, "status": j.status, "result": j.result, "error": j.error, "finished_at": iso(j.finished_at)} for j in jobs]}
+    barricades = db.execute(select(Barricade).order_by(Barricade.id)).scalars().all()
+    revisions = {row.batch_id: row.revision for row in db.execute(select(BarricadeRuleSet)).scalars().all()}
+    latest_batch = batches[0].id if batches else None
+    dispositions = disposition_rows(db, latest_batch) if latest_batch else []
+    return {"user": user_view(user), "stats": {"assets": len(assets), "points": len(points), "zones": len(zones), "open_zones": sum(z.status not in ["closed", "split", "invalidated"] for z in zones), "notices": len(notices), "resurveys": len(resurveys), "barricades": sum(b.status == "active" for b in barricades), "deferred_points": sum(d["status"] == "deferred" for d in dispositions)}, "batches": [{"id": b.id, "batch_code": b.batch_code, "measured_at": iso(b.measured_at), "instrument": b.instrument, "coordinate_reference": b.coordinate_reference, "status": b.status, "notes": b.notes, "point_count": len(b.points), "barricade_revision": revisions.get(b.id, 0)} for b in batches], "assets": [asset_view(a) for a in assets], "points": [point_view(p) for p in points], "zones": [zone_view(z, db) for z in zones], "notices": [notice_view(n) for n in notices], "resurveys": [resurvey_view(r) for r in resurveys], "barricades": [barricade_view(b) for b in barricades], "dispositions": dispositions, "jobs": [{"id": j.id, "job_code": j.job_code, "batch_id": j.batch_id, "status": j.status, "result": j.result, "error": j.error, "finished_at": iso(j.finished_at)} for j in jobs]}
 
 @app.get("/api/survey-batches/{batch_id}")
 def batch_detail(batch_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
@@ -130,6 +148,12 @@ def enqueue_cluster(batch_id: int, db: Session = Depends(get_db), user: User = D
     batch = db.get(SurveyBatch, batch_id)
     if not batch:
         raise HTTPException(404, "测量批次不存在")
+    active_order = db.execute(
+        select(WorkNotice.id).join(RepairZone, RepairZone.id == WorkNotice.zone_id)
+        .where(RepairZone.batch_id == batch_id, WorkNotice.status != "cancelled")
+    ).first()
+    if active_order:
+        raise HTTPException(409, "批次已有施工联动单，不能重新聚类；请先撤除或完工相关联动单")
     points = build_input(db, batch)
     refs = {batch.coordinate_reference, *(p["coordinate_reference"] for p in points)}
     if len(refs) != 1:
@@ -157,6 +181,8 @@ def zones(db: Session = Depends(get_db), user: User = Depends(current_user)):
 def split_zone(zone_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):
     zone = db.get(RepairZone, zone_id)
     if not zone: raise HTTPException(404, "维修片区不存在")
+    lock_batch(db, zone.batch_id)
+    db.refresh(zone)
     if zone.status != "needs_split": raise HTTPException(409, "当前片区没有待拆分的道路边界冲突")
     points = db.execute(select(SurveyPoint).where(SurveyPoint.id.in_(zone.point_ids))).scalars().all()
     notice = db.get(WorkNotice, zone.conflict_notice_id)
@@ -173,22 +199,78 @@ def split_zone(zone_id: int, db: Session = Depends(get_db), user: User = Depends
         child = RepairZone(zone_code=f"{zone.zone_code}-S{idx}", batch_id=zone.batch_id, cluster_label=zone.cluster_label, name=f"{zone.name} / 边界片 {idx}", status="ready_for_notice", point_ids=[p.id for p in members], center_x=round(sum(p.x for p in members)/len(members),2), center_y=round(sum(p.y for p in members)/len(members),2), average_settlement_mm=round(sum(p.settlement_mm for p in members)/len(members),2), max_settlement_mm=max(p.settlement_mm for p in members), local_density=zone.local_density, boundary=b, original_cluster_evidence={"split_from": zone.zone_code, "split_axis": "x", "split_x": split_x, "source_evidence": zone.original_cluster_evidence}, split_from_id=zone.id)
         db.add(child); children.append(child)
     record(db, user.id, "split_zone_by_road_boundary", "RepairZone", zone.zone_code, {"children": [f"{zone.zone_code}-S1", f"{zone.zone_code}-S2"], "split_x": split_x})
+    db.flush(); sync_dispositions(db, zone.batch_id)
     db.commit()
     return {"source_zone": zone.zone_code, "children": [c.zone_code for c in children], "status": zone.status, "split_reason": zone.split_reason}
+
+@app.post("/api/survey-batches/{batch_id}/barricades")
+def create_barricade(batch_id: int, payload: BarricadeIn, db: Session = Depends(get_db), user: User = Depends(require_roles("operator", "supervisor"))):
+    batch = db.get(SurveyBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "测量批次不存在")
+    try:
+        boundary = normalize_boundary(payload.boundary)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    lock_batch(db, batch_id)
+    barricade = Barricade(barricade_code=barricade_code(db, batch), batch_id=batch_id, label=payload.label.strip(), boundary=boundary, status="active", note=payload.note.strip(), created_by=user.id)
+    db.add(barricade)
+    db.flush()
+    result = recompute_after_rule_change(db, batch_id)
+    record(db, user.id, "register_barricade", "Barricade", barricade.barricade_code, {"batch_code": batch.batch_code, "boundary": boundary, **result})
+    db.commit(); db.refresh(barricade)
+    return {"barricade": barricade_view(barricade), "revision": result["revision"], "zones": result["zones"]}
+
+@app.delete("/api/barricades/{barricade_id}")
+def remove_barricade(barricade_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("operator", "supervisor"))):
+    barricade = db.get(Barricade, barricade_id)
+    if not barricade:
+        raise HTTPException(404, "围挡不存在")
+    if barricade.status != "active":
+        raise HTTPException(409, "围挡已撤除")
+    lock_batch(db, barricade.batch_id)
+    db.refresh(barricade)
+    if barricade.status != "active":
+        raise HTTPException(409, "围挡已撤除")
+    barricade.status = "removed"; barricade.removed_by = user.id; barricade.removed_at=datetime.now(timezone.utc)
+    db.flush()
+    result = recompute_after_rule_change(db, barricade.batch_id)
+    record(db, user.id, "remove_barricade", "Barricade", barricade.barricade_code, {"batch_id": barricade.batch_id, **result})
+    db.commit()
+    return {"barricade": barricade_view(barricade), "revision": result["revision"], "zones": result["zones"]}
+
+@app.get("/api/survey-batches/{batch_id}/barricades")
+def list_barricades(batch_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    rows = db.execute(select(Barricade).where(Barricade.batch_id == batch_id).order_by(Barricade.id)).scalars().all()
+    return {"revision": revision_of(db, batch_id), "barricades": [barricade_view(row) for row in rows]}
+
+@app.get("/api/survey-batches/{batch_id}/dispositions")
+def list_dispositions(batch_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    if not db.get(SurveyBatch, batch_id):
+        raise HTTPException(404, "测量批次不存在")
+    return {"revision": revision_of(db, batch_id), "rows": disposition_rows(db, batch_id)}
 
 @app.post("/api/zones/{zone_id}/work-notices")
 def create_notice(zone_id: int, payload: NoticeIn, db: Session = Depends(get_db), user: User = Depends(require_roles("operator", "supervisor"))):
     zone = db.get(RepairZone, zone_id)
     if not zone: raise HTTPException(404, "维修片区不存在")
+    lock_batch(db, zone.batch_id)
+    db.refresh(zone)
     if zone.status not in ["proposed", "ready_for_notice"]: raise HTTPException(409, "当前片区不能发起施工联动")
+    if db.execute(select(WorkNotice).where(WorkNotice.zone_id == zone.id, WorkNotice.status != "cancelled")).scalar_one_or_none():
+        raise HTTPException(409, "该片区已有施工联动单")
     notice = WorkNotice(notice_code=f"WN-{zone.zone_code}-{int(datetime.now().timestamp())}", zone_id=zone.id, road_name=payload.road_name, contractor=payload.contractor, permit_no=payload.permit_no, starts_at=payload.starts_at, ends_at=payload.ends_at, boundary=zone.boundary, status="submitted", lane_closure_required=payload.lane_closure_required, created_by=user.id)
-    db.add(notice); zone.status = "notice_sent"; record(db, user.id, "submit_work_notice", "WorkNotice", notice.notice_code, {"zone_code": zone.zone_code}); db.commit(); db.refresh(notice)
+    db.add(notice); zone.status = "notice_sent"; db.flush(); sync_dispositions(db, zone.batch_id); record(db, user.id, "submit_work_notice", "WorkNotice", notice.notice_code, {"zone_code": zone.zone_code}); db.commit(); db.refresh(notice)
     return notice_view(notice)
 
 @app.post("/api/work-notices/{notice_id}/acknowledge")
 def acknowledge_notice(notice_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("supervisor"))):
     notice = db.get(WorkNotice, notice_id)
     if not notice: raise HTTPException(404, "施工联动单不存在")
+    if notice.zone_id:
+        notice_zone = db.get(RepairZone, notice.zone_id)
+        if notice_zone: lock_batch(db, notice_zone.batch_id)
+        db.refresh(notice)
     if notice.status != "submitted": raise HTTPException(409, "施工联动单不在待确认状态")
     notice.status = "active"; record(db, user.id, "acknowledge_work_notice", "WorkNotice", notice.notice_code, {"status": "active"}); db.commit()
     return notice_view(notice)
@@ -197,9 +279,12 @@ def acknowledge_notice(notice_id: int, db: Session = Depends(get_db), user: User
 def start_repair(zone_id: int, db: Session = Depends(get_db), user: User = Depends(require_roles("operator", "supervisor"))):
     zone = db.get(RepairZone, zone_id)
     if not zone: raise HTTPException(404, "维修片区不存在")
+    lock_batch(db, zone.batch_id)
+    db.refresh(zone)
+    if zone.status == "invalidated": raise HTTPException(409, "该片区已因围挡规则更新失效，不能开工")
     notice = db.execute(select(WorkNotice).where(WorkNotice.zone_id == zone.id, WorkNotice.status == "active")).scalar_one_or_none()
     if not notice: raise HTTPException(409, "施工联动单未激活，不能开始维修")
-    zone.status = "repairing"; record(db, user.id, "start_repair", "RepairZone", zone.zone_code, {"notice_code": notice.notice_code}); db.commit()
+    zone.status = "repairing"; db.flush(); sync_dispositions(db, zone.batch_id); record(db, user.id, "start_repair", "RepairZone", zone.zone_code, {"notice_code": notice.notice_code, "barricade_revision": revision_of(db, zone.batch_id)}); db.commit()
     return zone_view(zone, db)
 
 @app.post("/api/zones/{zone_id}/resurvey")

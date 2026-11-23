@@ -34,3 +34,8 @@ class ResurveyIn(BaseModel):
     measured_at: datetime
     settlement_after_mm: float = Field(ge=0, le=200)
     notes: str = ""
+
+class BarricadeIn(BaseModel):
+    label: str = Field(min_length=1, max_length=120)
+    boundary: dict
+    note: str = ""

@@ -105,6 +105,65 @@ class Resurvey(Base):
     verified_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     notes = Column(Text, nullable=True)
 
+class Barricade(Base):
+    """A physical fence around a road-works area.
+
+    Barricades serve two roles in the dispatch model:
+    - manholes inside the rectangle are deferred (they cannot be reached);
+    - a straight line between two nearby manholes is severed when it crosses
+      the rectangle, so the two points cannot end up in the same sub-zone.
+    """
+
+    __tablename__ = "barricades"
+    id = Column(Integer, primary_key=True)
+    barricade_code = Column(String(60), unique=True, nullable=False)
+    batch_id = Column(Integer, ForeignKey("survey_batches.id"), nullable=False)
+    zone_id = Column(Integer, ForeignKey("repair_zones.id"), nullable=True)
+    label = Column(String(120), nullable=False)
+    boundary = Column(JSON, nullable=False, default=dict)
+    status = Column(String(30), nullable=False, default="active")
+    note = Column(Text, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    removed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    removed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class BarricadeRuleSet(Base):
+    """Revision counter for the barricade rules of one survey batch.
+
+    The counter lives in its own table so existing databases can be upgraded
+    with ``create_all`` without altering the wide domain tables.
+    """
+
+    __tablename__ = "barricade_rule_sets"
+    id = Column(Integer, primary_key=True)
+    batch_id = Column(Integer, ForeignKey("survey_batches.id"), unique=True, nullable=False)
+    revision = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+
+class PointDisposition(Base):
+    """The single authoritative destination of every surveyed manhole.
+
+    ``point_id`` is unique: a manhole can only be on one existing work notice
+    (``committed``), deferred inside a barricade, or waiting in a derived
+    sub-zone / the unassigned pool.  This is the database-level guard against
+    a removal racing a repair start and assigning the same manhole twice.
+    """
+
+    __tablename__ = "point_dispositions"
+    id = Column(Integer, primary_key=True)
+    point_id = Column(Integer, ForeignKey("survey_points.id"), unique=True, nullable=False)
+    batch_id = Column(Integer, ForeignKey("survey_batches.id"), nullable=False)
+    status = Column(String(30), nullable=False, default="pending")
+    zone_id = Column(Integer, ForeignKey("repair_zones.id"), nullable=True)
+    notice_id = Column(Integer, ForeignKey("work_notices.id"), nullable=True)
+    barricade_id = Column(Integer, ForeignKey("barricades.id"), nullable=True)
+    reason = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+
 class AnalysisJob(Base):
     __tablename__ = "analysis_jobs"
     id = Column(Integer, primary_key=True)

@@ -17,3 +17,6 @@ export const acknowledgeNotice=id=>api(`/work-notices/${id}/acknowledge`,{method
 export const startRepair=id=>api(`/zones/${id}/start-repair`,{method:'POST'});
 export const submitResurvey=(id,payload)=>api(`/zones/${id}/resurvey`,{method:'POST',body:JSON.stringify(payload)});
 export const verifyResurvey=id=>api(`/resurveys/${id}/verify`,{method:'POST'});
+export const createBarricade=(batchId,payload)=>api(`/survey-batches/${batchId}/barricades`,{method:'POST',body:JSON.stringify(payload)});
+export const removeBarricade=id=>api(`/barricades/${id}`,{method:'DELETE'});
+export const loadDispositions=batchId=>api(`/survey-batches/${batchId}/dispositions`);
